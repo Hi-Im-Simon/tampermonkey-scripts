@@ -1,12 +1,15 @@
 // ==UserScript==
 // @name         Session Timer
 // @namespace    session-timer
-// @version      2.9.5
+// @version      2.11.0
 // @description  A draggable session timer with saved time limits, configurable reminders and end alerts.
 // @match        https://config.example.invalid/*
 // @grant        GM.getTab
 // @grant        GM.saveTab
+// @grant        GM.setValue
+// @grant        GM.deleteValue
 // @grant        GM_getValue
+// @grant        GM_listValues
 // @grant        GM_setValue
 // @run-at       document-start
 // @noframes
@@ -28,6 +31,7 @@
   const DEFAULT_TARGET_MINUTES = 15;
   const TARGET_PRESETS = [5, 7, 10, 12, DEFAULT_TARGET_MINUTES, 20, 30, 60];
   const PREFERENCES_KEY = "session-timer.preferences";
+  const CUSTOM_SOUND_PREFIX = "session-timer.custom-sound.";
   const TAB_TIMER_KEY = "session-timer.session";
   // Add the actual sites in Tampermonkey > Settings > User matches.
   // Open a matched page once to create this entry in Tampermonkey > Storage.
@@ -160,12 +164,14 @@
     nearEnd: DEFAULT_ALERT_SOUND,
     end: DEFAULT_ALERT_SOUND,
   };
+  const customSounds = new Map();
   const alertTiming = { ...DEFAULT_ALERT_TIMING };
   let lastHandledCueAt = -1;
   let alertSchedule = null;
   let audioOutputs = null;
-  const scheduledNotes = new Map();
-  const previewNotes = new Map();
+  const scheduledSounds = new Map();
+  const previewSounds = new Map();
+  let previewRequest = null;
 
   let overlay = null;
 
@@ -180,6 +186,7 @@
   let bodyPanel = null;
   let detailsPanel = null;
   let alertSettings = null;
+  let customSoundLibrary = null;
   let progressFill = null;
 
   // =========================
@@ -281,7 +288,7 @@
 
   function resetTimer() {
     clearAlertSchedule();
-    stopNotes(previewNotes);
+    stopPreview();
     timerStartTimestamp = waitingForStartup ? null : Date.now();
     lastHandledCueAt = -1;
     void saveTimerSession();
@@ -416,7 +423,11 @@
     const dueIndex = lastCueIndexAt(active, elapsed);
 
     // When audio resumes, play the latest due cue only.
-    if (elapsed < active.end && dueIndex >= active.nextIndex) {
+    if (
+      elapsed < active.end &&
+      dueIndex >= active.nextIndex &&
+      isAlertSoundReady(active.sound)
+    ) {
       queueAlert(active, dueIndex);
       lastHandledCueAt = cueTime(active, dueIndex);
       active.nextIndex = dueIndex + 1;
@@ -430,6 +441,9 @@
   }
 
   function queueUpcoming(series, elapsed) {
+    if (!isAlertSoundReady(series.sound)) {
+      return;
+    }
     const firstFuture = lastCueIndexAt(series, elapsed) + 1;
     series.nextIndex = Math.max(series.nextIndex, firstFuture);
 
@@ -466,32 +480,66 @@
   }
 
   function queueAlert(series, index) {
+    const group = series.sound;
     const start = Math.max(
       audioContext.currentTime + AUDIO_START_DELAY_SECONDS,
       (cueTime(series, index) - alertSchedule.offset) / 1000,
     );
-    const stopAt =
-      series.sound === "end"
-        ? (series.end - alertSchedule.offset) / 1000
-        : Infinity;
-    playChime(
-      series.sound,
+    let cutoff = group === "end" ? series.end : Infinity;
+    if (customSounds.get(alertSounds[group])?.buffer) {
+      // A long clip should give way to the next repeat or alert group.
+      cutoff = index < series.lastIndex ? cueTime(series, index + 1) : series.end;
+    }
+    playAlertSound(
+      group,
       start,
-      audioOutputs[series.sound],
-      scheduledNotes,
+      audioOutputs[group],
+      scheduledSounds,
       1,
-      stopAt,
+      (cutoff - alertSchedule.offset) / 1000,
     );
   }
 
   function clearAlertSchedule() {
-    stopNotes(scheduledNotes);
+    stopSounds(scheduledSounds);
     alertSchedule = null;
   }
 
   // =========================
   // Audio
   // =========================
+
+  async function decodeCustomSound(data) {
+    const binary = atob(data);
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index++) {
+      bytes[index] = binary.charCodeAt(index);
+    }
+    const Decoder =
+      window.OfflineAudioContext || window.webkitOfflineAudioContext;
+    return new Decoder(1, 1, 44100).decodeAudioData(bytes.buffer);
+  }
+
+  function isAlertSoundReady(group) {
+    const sound = customSounds.get(alertSounds[group]);
+    return !sound || sound.buffer !== undefined;
+  }
+
+  function loadCustomSound(id) {
+    const sound = customSounds.get(id);
+    if (sound && sound.buffer === undefined) {
+      sound.loading ??= Promise.resolve().then(async () => {
+        try {
+          sound.buffer = await decodeCustomSound(GM_getValue(id)?.data);
+        } catch (error) {
+          sound.buffer = null;
+          console.warn("[Session Timer] Could not load custom sound:", error);
+        }
+        scheduleAlerts();
+      });
+      return sound.loading;
+    }
+  }
 
   function updateAudioState() {
     const unlocked = audioContext?.state === "running";
@@ -505,7 +553,7 @@
     } else {
       rememberPlayedCues();
       clearAlertSchedule();
-      stopNotes(previewNotes);
+      stopPreview();
     }
     updateAudioButton();
   }
@@ -551,27 +599,63 @@
     }
   }
 
-  function stopNotes(activeNotes) {
+  function stopSounds(activeSounds) {
     if (audioContext && audioContext.state !== "closed") {
       const now = audioContext.currentTime;
-      for (const [oscillator, gain] of activeNotes) {
+      for (const [source, gain] of activeSounds) {
         gain.disconnect();
-        oscillator.stop(now);
+        source.stop(now);
       }
     }
-    activeNotes.clear();
+    activeSounds.clear();
   }
 
-  function playChime(
+  function stopPreview() {
+    previewRequest = null;
+    stopSounds(previewSounds);
+  }
+
+  function connectSound(source, gain, output, activeSounds) {
+    source.connect(gain);
+    gain.connect(output);
+    activeSounds.set(source, gain);
+    source.onended = () => {
+      if (activeSounds.delete(source)) {
+        gain.disconnect();
+      }
+      source.disconnect();
+    };
+  }
+
+  function playAlertSound(
     group,
     start,
     output,
-    activeNotes,
-    volume = 1,
+    activeSounds,
+    volume,
     stopAt = Infinity,
   ) {
+    const sound = alertSounds[group];
+    const buffer = customSounds.get(sound)?.buffer;
+    if (buffer) {
+      const duration = Math.min(buffer.duration, stopAt - start);
+      if (duration > 0) {
+        const source = audioContext.createBufferSource();
+        const gain = audioContext.createGain();
+        source.buffer = buffer;
+        gain.gain.value = volume;
+        connectSound(source, gain, output, activeSounds);
+        source.start(start, 0, duration);
+      }
+      return;
+    }
+    playChime(group, start, output, activeSounds, volume, stopAt);
+  }
+
+  function playChime(group, start, output, activeSounds, volume, stopAt) {
     const { level, notes } = CHIMES[group];
-    const style = ALERT_SOUNDS[alertSounds[group]];
+    const style =
+      ALERT_SOUNDS[alertSounds[group]] ?? ALERT_SOUNDS[DEFAULT_ALERT_SOUND];
     if (
       stopAt !== Infinity &&
       notes.some(
@@ -601,32 +685,33 @@
         noteStart + style.attack,
       );
       gain.gain.exponentialRampToValueAtTime(0.0001, noteEnd);
-      oscillator.connect(gain);
-      gain.connect(output);
-      oscillator.onended = () => {
-        if (activeNotes.delete(oscillator)) {
-          gain.disconnect();
-        }
-        oscillator.disconnect();
-      };
+      connectSound(oscillator, gain, output, activeSounds);
       oscillator.start(noteStart);
       oscillator.stop(noteEnd);
-      activeNotes.set(oscillator, gain);
     }
   }
 
   async function testSound(group) {
     const volume = alertVolumes[group];
-    if (volume > 0 && (await unlockAudio())) {
-      stopNotes(previewNotes);
-      playChime(
-        group,
-        audioContext.currentTime + AUDIO_START_DELAY_SECONDS,
-        audioContext.destination,
-        previewNotes,
-        volume / 100,
-      );
+    if (volume === 0) {
+      return;
     }
+    stopPreview();
+    const request = (previewRequest = Symbol());
+    if (!(await unlockAudio())) {
+      return;
+    }
+    await loadCustomSound(alertSounds[group]);
+    if (previewRequest !== request || !isAudioUnlocked) {
+      return;
+    }
+    playAlertSound(
+      group,
+      audioContext.currentTime + AUDIO_START_DELAY_SECONDS,
+      audioContext.destination,
+      previewSounds,
+      volume / 100,
+    );
   }
 
   async function toggleMute() {
@@ -641,7 +726,7 @@
     void saveTimerSession();
     updateOutputVolumes();
     if (isMuted) {
-      stopNotes(previewNotes);
+      stopPreview();
     } else if (!isAudioUnlocked) {
       await unlockAudio();
     }
@@ -653,10 +738,6 @@
   // =========================
 
   function injectStyles() {
-    if (document.getElementById("session-timer-styles")) {
-      return;
-    }
-
     const style = document.createElement("style");
     style.id = "session-timer-styles";
     style.textContent = `
@@ -787,7 +868,8 @@
       }
       #session-timer-overlay[data-phase="overdue"] .st-remaining { color: var(--st-danger); }
       #session-timer-overlay .st-select,
-      #session-timer-overlay .st-input {
+      #session-timer-overlay .st-input,
+      #session-timer-overlay .st-sound-action {
         min-width: 0;
         min-height: 25px;
         margin: 0;
@@ -848,7 +930,7 @@
         gap: 5px;
       }
       #session-timer-overlay .st-timing .st-input { text-align: right; }
-      #session-timer-overlay .st-timing .st-select { min-width: 90px; }
+      #session-timer-overlay .st-timing .st-select { min-width: 90px; max-width: 72%; }
       #session-timer-overlay .st-timing-input {
         display: inline-grid;
         grid-template-columns: auto 1em;
@@ -882,6 +964,43 @@
         grid-row: 1 / span 2;
       }
       #session-timer-overlay .st-volume :disabled { cursor: default; opacity: .5; }
+      #session-timer-overlay .st-custom-sound {
+        border-top: 1px solid var(--st-line);
+        padding-top: 6px;
+      }
+      #session-timer-overlay .st-custom-sound summary {
+        color: var(--st-text);
+        cursor: pointer;
+      }
+      #session-timer-overlay .st-custom-sound form,
+      #session-timer-overlay .st-sound-name {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr);
+        gap: 4px;
+      }
+      #session-timer-overlay .st-custom-sound form { gap: 8px; margin-top: 8px; }
+      #session-timer-overlay .st-custom-sound :is(.st-input, .st-select) { width: 100%; }
+      #session-timer-overlay .st-custom-sound span { overflow-wrap: anywhere; }
+      #session-timer-overlay .st-custom-sound [data-error] { color: var(--st-danger); }
+      #session-timer-overlay .st-sound-action { width: 100%; cursor: pointer; }
+      #session-timer-overlay .st-sound-action:hover:not(:disabled) {
+        border-color: var(--st-accent);
+      }
+      #session-timer-overlay .st-sound-save {
+        border-color: var(--st-accent);
+        background: var(--st-accent);
+        color: var(--st-bg);
+        font-weight: 600;
+      }
+      #session-timer-overlay .st-delete-sound {
+        border-top: 1px solid var(--st-line);
+        padding-top: 8px;
+      }
+      #session-timer-overlay .st-sound-delete { color: var(--st-danger); }
+      #session-timer-overlay .st-custom-sound :disabled { cursor: default; opacity: .5; }
+      #session-timer-overlay .st-custom-sound [role="status"]:empty {
+        position: absolute;
+      }
       #session-timer-overlay .st-settings-actions {
         display: flex;
         justify-content: space-between;
@@ -902,11 +1021,12 @@
       #session-timer-overlay .st-reset { color: var(--st-danger); }
       #session-timer-overlay .st-restore:hover,
       #session-timer-overlay .st-reset:hover { text-decoration: underline; }
-      #session-timer-overlay :is(button, select, input):focus-visible {
+      #session-timer-overlay :is(button, select, input, summary):focus-visible {
         outline: 2px solid var(--st-accent);
         outline-offset: 1px;
       }
     `;
+    document.getElementById(style.id)?.remove();
     document.head.appendChild(style);
   }
 
@@ -969,6 +1089,41 @@
       );
     }
     return readLegacyPreferences();
+  }
+
+  function isAlertSound(id) {
+    return (
+      typeof id === "string" &&
+      (Object.hasOwn(ALERT_SOUNDS, id) || customSounds.has(id))
+    );
+  }
+
+  function restoreCustomSounds() {
+    if (typeof GM_listValues !== "function") {
+      return;
+    }
+    const keys = new Set(GM_listValues());
+    const removed = [];
+    for (const id of customSounds.keys()) {
+      if (!keys.has(id)) {
+        customSounds.delete(id);
+        removed.push(id);
+      }
+    }
+    let added = false;
+    for (const id of keys) {
+      if (!id.startsWith(CUSTOM_SOUND_PREFIX) || customSounds.has(id)) {
+        continue;
+      }
+      const saved = GM_getValue(id);
+      if (typeof saved?.label === "string" && typeof saved.data === "string") {
+        customSounds.set(id, { label: saved.label });
+        added = true;
+      }
+    }
+    if (added || removed.length > 0) {
+      refreshCustomSoundControls(removed);
+    }
   }
 
   function readLegacyPreferences() {
@@ -1061,8 +1216,9 @@
         alertVolumes[group] = volume;
       }
       const sound = preferences[`${group}Sound`];
-      if (typeof sound === "string" && Object.hasOwn(ALERT_SOUNDS, sound)) {
+      if (isAlertSound(sound)) {
         alertSounds[group] = sound;
+        void loadCustomSound(sound);
       }
     }
     for (const key of Object.keys(alertTiming)) {
@@ -1245,6 +1401,7 @@
     detailsPanel.hidden = !open;
     settingsButton.setAttribute("aria-expanded", String(open));
     if (open) {
+      restoreCustomSounds();
       render();
       updateAlertPreview();
     }
@@ -1310,15 +1467,21 @@
     for (const [style, { label }] of Object.entries(ALERT_SOUNDS)) {
       picker.add(new Option(label, style));
     }
+    const customOptions = createElement("optgroup");
+    customOptions.label = "Custom sounds";
+    customOptions.hidden = customSounds.size === 0;
+    customOptions.append(...createCustomSoundOptions());
+    picker.append(customOptions);
     picker.value = alertSounds[group];
     picker.addEventListener("change", () => {
-      const style = picker.value;
-      if (!Object.hasOwn(ALERT_SOUNDS, style) || alertSounds[group] === style) {
+      const sound = picker.value;
+      if (!isAlertSound(sound) || alertSounds[group] === sound) {
         return;
       }
-      alertSounds[group] = style;
-      savePreferences({ [`${group}Sound`]: style });
-      stopNotes(previewNotes);
+      alertSounds[group] = sound;
+      savePreferences({ [`${group}Sound`]: sound });
+      stopPreview();
+      void loadCustomSound(sound);
       refreshAlertSchedule();
     });
     const row = appendChildren(
@@ -1326,7 +1489,229 @@
       createElement("span", { text: "Sound" }),
       picker,
     );
-    return { row, picker };
+    return { row, picker, customOptions };
+  }
+
+  function createCustomSoundOptions() {
+    return Array.from(customSounds, ([id, { label }]) => new Option(label, id));
+  }
+
+  function refreshCustomSoundControls(removed = []) {
+    if (!alertSettings) {
+      return;
+    }
+    const defaults = {};
+    let selectionChanged = false;
+    for (const [group, settings] of Object.entries(alertSettings)) {
+      const { picker, customOptions } = settings.sound;
+      if (removed.length > 0) {
+        const preference = `${group}Sound`;
+        const saved = GM_getValue(`${PREFERENCES_KEY}.${preference}`);
+        if (removed.includes(saved)) {
+          defaults[preference] = DEFAULT_ALERT_SOUND;
+        }
+      }
+      if (!isAlertSound(alertSounds[group])) {
+        alertSounds[group] = DEFAULT_ALERT_SOUND;
+        selectionChanged = true;
+      }
+      customOptions.replaceChildren(...createCustomSoundOptions());
+      customOptions.hidden = customSounds.size === 0;
+      picker.value = alertSounds[group];
+    }
+    if (Object.keys(defaults).length > 0) {
+      savePreferences(defaults);
+    }
+    if (selectionChanged) {
+      stopPreview();
+      refreshAlertSchedule();
+    }
+    customSoundLibrary?.refresh();
+  }
+
+  function readAudioFile(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        resolve(reader.result.slice(reader.result.indexOf(",") + 1));
+      };
+      reader.onerror = () => reject(reader.error);
+      reader.onabort = () => reject(new Error("Audio file read was cancelled."));
+      reader.readAsDataURL(file);
+    });
+  }
+
+  function createCustomSoundSettings() {
+    const section = createElement("details", { className: "st-custom-sound" });
+    const form = createElement("form");
+    const name = createElement("input", {
+      className: "st-input",
+      type: "text",
+    });
+    name.disabled = true;
+    const nameLabel = appendChildren(
+      createElement("label", { className: "st-sound-name" }),
+      createElement("span", { text: "Sound name" }),
+      name,
+    );
+    // Keep the selected file out of the host page's DOM.
+    const fileInput = createElement("input", { type: "file" });
+    fileInput.accept = "audio/*,.aac,.flac,.m4a,.mp3,.ogg,.opus,.wav,.webm";
+    const choose = createElement("button", {
+      className: "st-sound-action",
+      text: "Choose audio file",
+      type: "button",
+    });
+    const add = createElement("button", {
+      className: "st-sound-action st-sound-save",
+      text: "Add sound",
+      type: "submit",
+    });
+    add.disabled = true;
+    const fileName = createElement("span", { id: "st-custom-sound-file-name" });
+    fileName.hidden = true;
+    choose.setAttribute("aria-describedby", fileName.id);
+    const status = createElement("span");
+    status.setAttribute("role", "status");
+    let suggestedName = "";
+
+    choose.addEventListener("click", () => fileInput.click());
+    fileInput.addEventListener("change", () => {
+      const file = fileInput.files[0];
+      const nextName = file ? file.name.replace(/\.[^.]+$/, "") || file.name : "";
+      if (!name.value.trim() || name.value === suggestedName) {
+        name.value = nextName;
+      }
+      suggestedName = nextName;
+      choose.textContent = file ? "Change audio file" : "Choose audio file";
+      fileName.textContent = file?.name ?? "";
+      fileName.hidden = !file;
+      add.disabled = name.disabled = !file;
+      delete status.dataset.error;
+      status.textContent = "";
+      if (file) {
+        name.focus();
+        name.select();
+      }
+    });
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      if (add.disabled) {
+        return;
+      }
+      const label = name.value.trim();
+      const file = fileInput.files[0];
+      if (!label || !file) {
+        status.dataset.error = "";
+        status.textContent = file
+          ? "Enter a name for the sound."
+          : "Choose an audio file.";
+        (file ? name : choose).focus();
+        return;
+      }
+
+      add.disabled = choose.disabled = name.disabled = true;
+      delete status.dataset.error;
+      status.textContent = "Adding sound…";
+      let errorMessage =
+        "Could not read this audio file. Try a supported format such as MP3 or WAV.";
+      try {
+        const data = await readAudioFile(file);
+        const buffer = await decodeCustomSound(data);
+        const id =
+          CUSTOM_SOUND_PREFIX + crypto.getRandomValues(new Uint32Array(4)).join("-");
+        errorMessage = "Could not save the sound in Tampermonkey.";
+        await GM.setValue(id, { label, data });
+        customSounds.set(id, { label, buffer });
+        refreshCustomSoundControls();
+        form.reset();
+        fileInput.value = "";
+        suggestedName = "";
+        choose.textContent = "Choose audio file";
+        fileName.textContent = "";
+        fileName.hidden = true;
+        status.textContent = `Added “${label}”. Select it from any Sound list.`;
+      } catch (error) {
+        status.dataset.error = "";
+        status.textContent = errorMessage;
+        console.warn("[Session Timer] Could not add custom sound:", error);
+      } finally {
+        choose.disabled = false;
+        add.disabled = name.disabled = fileInput.files.length === 0;
+      }
+    });
+    appendChildren(form, choose, fileName, nameLabel, add, status);
+    customSoundLibrary = createCustomSoundLibrary();
+    return appendChildren(
+      section,
+      createElement("summary", { text: "Custom sounds" }),
+      form,
+      customSoundLibrary.row,
+    );
+  }
+
+  function createCustomSoundLibrary() {
+    const form = createElement("form", { className: "st-delete-sound" });
+    const picker = createElement("select", { className: "st-select" });
+    const label = appendChildren(
+      createElement("label", { className: "st-sound-name" }),
+      createElement("span", { text: "Sound to delete" }),
+      picker,
+    );
+    const remove = createElement("button", {
+      className: "st-sound-action st-sound-delete",
+      text: "Delete sound",
+      type: "submit",
+    });
+    const status = createElement("span");
+    status.setAttribute("role", "status");
+    let deleting = false;
+
+    function refresh() {
+      const selected = picker.value;
+      picker.replaceChildren(
+        new Option("Select a sound", ""),
+        ...createCustomSoundOptions(),
+      );
+      picker.value = customSounds.has(selected) ? selected : "";
+      picker.disabled = deleting;
+      remove.disabled = deleting || !picker.value;
+      form.hidden = customSounds.size === 0;
+    }
+
+    picker.addEventListener("change", () => {
+      remove.disabled = !picker.value;
+      delete status.dataset.error;
+      status.textContent = "";
+    });
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const id = picker.value;
+      const sound = customSounds.get(id);
+      if (deleting || !sound) {
+        return;
+      }
+      deleting = picker.disabled = remove.disabled = true;
+      delete status.dataset.error;
+      status.textContent = "Deleting sound…";
+      try {
+        await GM.deleteValue(id);
+        customSounds.delete(id);
+        refreshCustomSoundControls([id]);
+        status.textContent = `Deleted “${sound.label}”.`;
+      } catch (error) {
+        status.dataset.error = "";
+        status.textContent = "Could not delete the sound in Tampermonkey.";
+        console.warn("[Session Timer] Could not delete custom sound:", error);
+      } finally {
+        deleting = false;
+        refresh();
+      }
+    });
+
+    appendChildren(form, label, remove);
+    refresh();
+    return { row: appendChildren(createElement("div"), form, status), refresh };
   }
 
   function createTimingControl(
@@ -1562,7 +1947,7 @@
       preferences[`${group}Sound`] = DEFAULT_ALERT_SOUND;
     }
     savePreferences(preferences);
-    stopNotes(previewNotes);
+    stopPreview();
     updateOutputVolumes();
     refreshAlertSchedule();
     updateAlertPreview();
@@ -1769,7 +2154,12 @@
       restoreButton,
       resetButton,
     );
-    appendChildren(detailsPanel, ...createAlertSettings(), actions);
+    appendChildren(
+      detailsPanel,
+      ...createAlertSettings(),
+      createCustomSoundSettings(),
+      actions,
+    );
     appendChildren(bodyPanel, controls, customRow, detailsPanel);
     overlay.append(header, progressTrack, bodyPanel);
     document.body.append(overlay);
@@ -2059,8 +2449,11 @@
   }
 
   function refreshAfterFocus() {
-    if (!document.hidden && hasUnlockedAudio && !isAudioUnlocked && !isMuted) {
-      void unlockAudio();
+    if (!document.hidden) {
+      restoreCustomSounds();
+      if (hasUnlockedAudio && !isAudioUnlocked && !isMuted) {
+        void unlockAudio();
+      }
     }
     tick();
   }
@@ -2076,6 +2469,7 @@
       removeExistingUi();
       injectStyles();
       migratePreferences();
+      restoreCustomSounds();
       restorePreferences();
       createOverlay();
       startWhenStartupVisible();

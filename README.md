@@ -13,7 +13,7 @@ A collection of Tampermonkey userscripts for automating everyday browser tasks a
 Use these steps for scripts that support custom site addresses and settings. Replace the example domains and selector with your own values.
 
 1. In **Dashboard → Settings**, set **Config mode** to **Advanced** and save.
-2. In **Installed userscripts**, click the script name. Open **Settings → User matches**, add each URL pattern as a separate entry, and save. These patterns control where the script runs. [URL matching help](https://www.tampermonkey.net/faq.php?locale=en&q=Q103)
+2. In **Installed userscripts**, click the script name. Open **Settings → User matches**, add each URL pattern as a separate entry, and save. These patterns control for which URLs the script is allowed to run. [URL matching help](https://www.tampermonkey.net/faq.php?locale=en&q=Q103)
 
    ```text
    https://start.example/*
